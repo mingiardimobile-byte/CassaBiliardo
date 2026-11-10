@@ -171,8 +171,8 @@ export type PageKey =
   | 'storico'
   | 'supervisione'
   | 'insoluti'
-  | 'impostazioni'
-  | 'rettifiche';
+  | 'rettifiche'
+  | 'impostazioni';
 
 export type DialogResult = { proceed: boolean; discountPct?: number; rounding?: number };
 
@@ -186,4 +186,19 @@ export type PlayerCheckout = {
   barDiscountPct: number;
   barRounding: number;
   paymentMode: 'pagato' | 'sospeso' | 'insoluto';
+};
+
+export type ClosedTableEntry = {
+  id: string;
+  tableId: number;
+  tableName: string;
+  openTime: number;
+  closeTime: number;
+  players: {
+    athleteId: string;
+    name: string;
+    amount: number;
+    paymentMode: 'pagato' | 'sospeso' | 'insoluto';
+  }[];
+  total: number;
 };

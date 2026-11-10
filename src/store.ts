@@ -2,8 +2,9 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type {
   Table, Product, Athlete, SuspendedOrder, Subscription,
-  Reconciliation, Settings, AuditEntry, RevenueLine, BarItem, Expense, PlayerCheckout,
+  Reconciliation, Settings, AuditEntry, RevenueLine, BarItem, Expense, PlayerCheckout, ClosedTableEntry,
 } from '@/types';
+import { fmtEuro } from '@/lib/utils';
 
 type StoreState = {
   tables: Table[];
@@ -15,14 +16,14 @@ type StoreState = {
   settings: Settings;
   auditLog: AuditEntry[];
   revenueLines: RevenueLine[];
-  expenses: { id: string; description: string; category: string; amount: number; at: number }[];
+  expenses: Expense[];
   fund: number;
   cumulativeTotalizer: number;
   currentOperator: string;
   isAdminUnlocked: boolean;
   isOwnerUnlocked: boolean;
   lastActivity: number;
-  closedTableDetails: Record<number, { athleteId: string; name: string; amount: number; paymentMode: string }[]>;
+  closedTableDetails: ClosedTableEntry[];
 
   setOperator: (name: string) => void;
   unlockAdmin: (password: string) => boolean;
@@ -87,7 +88,8 @@ type StoreState = {
   importState: (s: Partial<StoreState>) => void;
   setTableTotalizer: (amount: number) => void;
   adjustPlayerPayment: (athleteId: string, newPaidAmount: number, reason: string) => void;
-  rectifyClosedTablePayment: (tableId: number, athleteId: string, newPaidAmount: number, reason: string) => void;
+  rectifyClosedTablePayment: (entryId: string, athleteId: string, newPaidAmount: number, newPaymentMode: 'pagato' | 'sospeso' | 'insoluto', reason: string) => void;
+  batchRectifyPlayers: (entryId: string, athleteIds: string[], newPaymentMode: 'pagato' | 'sospeso' | 'insoluto', reason: string) => void;
   logAudit: (action: string, value: string) => void;
 };
 
@@ -136,18 +138,15 @@ const DEFAULT_SETTINGS: Settings = {
   generalTotalizerOverrideDate: null,
 };
 
-// Calcola le ore effettive di permanenza di un giocatore
 const getPlayerHours = (player: { joinTime?: number }, table: Table, now: number) => {
   const joinTime = player.joinTime ?? table.startTime ?? now;
   const elapsedMs = (table.pausedAt ?? now) - joinTime;
-  // Sottraggo le pause fatte dopo il join del giocatore
   const pauseAfterJoin = table.pauseLogs
     .filter(log => log.at >= joinTime)
     .reduce((sum, log) => sum + log.durationMs, 0);
   return Math.max(0, (elapsedMs - pauseAfterJoin) / 3600000);
 };
 
-// Calcola il nolo teorico per un singolo giocatore
 const calcPlayerNolo = (player: { isSubscribed: boolean; joinTime?: number }, table: Table, now: number, baseRate: number, tableMax: number) => {
   if (player.isSubscribed) return 0;
   const hours = getPlayerHours(player, table, now);
@@ -158,9 +157,30 @@ const calcPlayerNolo = (player: { isSubscribed: boolean; joinTime?: number }, ta
   if (n <= 2) {
     return baseRate * hours;
   } else {
-    // 3+ giocatori: tableMax diviso per num paganti, moltiplicato per ore individuali
     return (tableMax / Math.max(1, noloPaying)) * hours;
   }
+};
+
+const recordTableClose = (
+  table: Table,
+  checkouts: PlayerCheckout[],
+  perPlayer: number[],
+  now: number
+): ClosedTableEntry => {
+  return {
+    id: uid(),
+    tableId: table.id,
+    tableName: table.name,
+    openTime: table.startTime ?? now,
+    closeTime: now,
+    players: checkouts.map((c, i) => ({
+      athleteId: c.athleteId,
+      name: c.name,
+      amount: perPlayer[i],
+      paymentMode: c.paymentMode,
+    })),
+    total: perPlayer.reduce((s, a) => s + a, 0),
+  };
 };
 
 export const useStore = create<StoreState>()(
@@ -182,7 +202,7 @@ export const useStore = create<StoreState>()(
       isAdminUnlocked: false,
       isOwnerUnlocked: false,
       lastActivity: Date.now(),
-      closedTableDetails: {},
+      closedTableDetails: [],
 
       setOperator: (name) => set({ currentOperator: name }),
 
@@ -401,9 +421,7 @@ export const useStore = create<StoreState>()(
         if (!t || t.status !== 'occupato') return null;
         const now = Date.now();
         const { baseRate, tableMax } = get().settings;
-        const n = t.players.length;
 
-        // Calcolo nolo teorico INDIVIDUALE per ogni giocatore
         const playerNoloMap = new Map<string, number>();
         let noloTheoreticalTotal = 0;
         t.players.forEach((p) => {
@@ -484,8 +502,10 @@ export const useStore = create<StoreState>()(
           operator: get().currentOperator || 'Operatore',
         };
 
+        const entry = recordTableClose(t, checkouts, perPlayer, now);
+
         set({
-          closedTableDetails: { ...get().closedTableDetails, [id]: checkouts.map((c, i) => ({ athleteId: c.athleteId, name: c.name, amount: perPlayer[i], paymentMode: c.paymentMode })) },
+          closedTableDetails: [...get().closedTableDetails, entry],
           revenueLines: [...get().revenueLines, revenueLine],
           suspendedOrders: [
             ...get().suspendedOrders.filter(
@@ -548,7 +568,6 @@ export const useStore = create<StoreState>()(
         const exitingPlayers = t.players.filter((p) => exitingIds.has(p.athleteId));
         const remainingPlayers = t.players.filter((p) => !exitingIds.has(p.athleteId));
 
-        // Calcolo nolo teorico INDIVIDUALE per ogni giocatore in uscita
         const playerNoloMap = new Map<string, number>();
         let exitingNoloTheoretical = 0;
         exitingPlayers.forEach((p) => {
@@ -610,7 +629,10 @@ export const useStore = create<StoreState>()(
         const totalDiscount = totalNoloDiscount + totalBarDiscount;
         const totalRounding = totalNoloRounding + totalBarRounding;
 
+        const entry = recordTableClose(t, checkouts, perPlayer, now);
+
         set({
+          closedTableDetails: [...get().closedTableDetails, entry],
           suspendedOrders: [
             ...get().suspendedOrders.filter(
               (o) => !(o.source === 'tavolo' && o.status === 'sospeso' && exitingIds.has(o.athleteId))
@@ -655,7 +677,6 @@ export const useStore = create<StoreState>()(
         const now = Date.now();
         const { baseRate, tableMax } = get().settings;
         
-        // Calcolo nolo individuale per ogni giocatore
         let cost = 0;
         t.players.forEach((p) => {
           cost += calcPlayerNolo(p, t, now, baseRate, tableMax);
@@ -811,7 +832,6 @@ export const useStore = create<StoreState>()(
       closeReconciliation: () => {
         const today = new Date();
         const dateStr = today.toISOString().slice(0, 10);
-        const startOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
 
         const activeRevenue = get().revenueLines.filter((r) => !r.voided);
         const revenue = activeRevenue.reduce((s, r) => s + r.amount, 0);
@@ -819,14 +839,13 @@ export const useStore = create<StoreState>()(
         const expenses = get().expenses.reduce((s, e) => s + e.amount, 0);
         const fund = get().fund;
 
-        const closedToday = get().tables.filter((t) => t.closedAt && t.closedAt >= startOfDay && !t.deleted);
-        const tavoliTheoretical = closedToday.reduce((s, t) => s + (t.theoreticalCost ?? 0), 0);
+        const tavoliTheoretical = activeRevenue.filter((r) => r.source === 'tavolo').reduce((s, r) => s + r.amount, 0);
         const tavoliReal = activeRevenue.filter((r) => r.source === 'tavolo').reduce((s, r) => s + r.amount, 0);
-        const tavoliDiscounts = closedToday.reduce((s, t) => s + t.discountAmount, 0);
-        const tavoliRounding = closedToday.reduce((s, t) => s + t.roundingAmount, 0);
+        const tavoliDiscounts = 0;
+        const tavoliRounding = 0;
         const barReal = activeRevenue.filter((r) => r.source === 'bar' || r.source === 'sospeso').reduce((s, r) => s + r.amount, 0);
-        const barDiscounts = closedToday.reduce((s, t) => s + t.barDiscount, 0);
-        const barRounding = closedToday.reduce((s, t) => s + t.barRounding, 0);
+        const barDiscounts = 0;
+        const barRounding = 0;
         const abbonamentiReal = activeRevenue.filter((r) => r.source === 'abbonamento').reduce((s, r) => s + r.amount, 0);
 
         const nominalToday = tavoliTheoretical;
@@ -862,6 +881,7 @@ export const useStore = create<StoreState>()(
           expenses: [],
           auditLog: [],
           fund: fund + revenue - expenses,
+          closedTableDetails: [],
         });
         get().logAudit('Chiusura cassa', dateStr);
         return rec;
@@ -887,6 +907,7 @@ export const useStore = create<StoreState>()(
           auditLog: [],
           fund: 0,
           cumulativeTotalizer: get().cumulativeTotalizer,
+          closedTableDetails: [],
         }),
 
       importState: (s) => set({ ...s }),
@@ -928,39 +949,129 @@ export const useStore = create<StoreState>()(
         }
       },
 
-      rectifyClosedTablePayment: (tableId, athleteId, newPaidAmount, reason) => {
-        const details = get().closedTableDetails[tableId];
-        if (!details) return;
-        const original = details.find((d) => d.athleteId === athleteId);
+      rectifyClosedTablePayment: (entryId, athleteId, newPaidAmount, newPaymentMode, reason) => {
+        const entries = get().closedTableDetails;
+        const entryIndex = entries.findIndex((e) => e.id === entryId);
+        if (entryIndex === -1) return;
+        const entry = entries[entryIndex];
+        const original = entry.players.find((p) => p.athleteId === athleteId);
         if (!original) return;
-        const difference = Math.round((original.amount - newPaidAmount) * 100) / 100;
-        if (difference <= 0) return;
         const athlete = get().athletes.find((a) => a.id === athleteId);
         if (!athlete) return;
-        set({
-          athletes: get().athletes.map((a) =>
-            a.id === athleteId ? { ...a, debt: Math.round(((a.debt || 0) + difference) * 100) / 100 } : a
-          ),
-          closedTableDetails: {
-            ...get().closedTableDetails,
-            [tableId]: details.map((d) =>
-              d.athleteId === athleteId ? { ...d, amount: newPaidAmount, paymentMode: 'insoluto' } : d
-            ),
-          },
-        });
-        const storno: RevenueLine = {
-          id: uid(),
-          source: 'tavolo',
-          description: `STORNO rettifica tavolo ${tableId} - ${athlete.name}`,
-          amount: difference,
-          at: Date.now(),
-          voided: true,
-          operator: get().currentOperator || 'Admin',
+        
+        const difference = Math.round((newPaidAmount - original.amount) * 100) / 100;
+        
+        const updatedPlayers = entry.players.map((p) =>
+          p.athleteId === athleteId ? { ...p, amount: newPaidAmount, paymentMode: newPaymentMode } : p
+        );
+        const newTotal = Math.round(updatedPlayers.reduce((sum, p) => sum + p.amount, 0) * 100) / 100;
+        
+        const updatedEntries = [...entries];
+        updatedEntries[entryIndex] = {
+          ...entry,
+          players: updatedPlayers,
+          total: newTotal,
         };
-        set({ revenueLines: [...get().revenueLines, storno] });
+        
+        if (newPaymentMode === 'insoluto' && newPaidAmount < original.amount) {
+          const debtIncrease = Math.round((original.amount - newPaidAmount) * 100) / 100;
+          set({
+            athletes: get().athletes.map((a) =>
+              a.id === athleteId ? { ...a, debt: Math.round(((a.debt || 0) + debtIncrease) * 100) / 100 } : a
+            ),
+            closedTableDetails: updatedEntries,
+          });
+          get().logAudit(
+            'Rettifica: riduzione importo',
+            `${athlete.name}: da €${original.amount.toFixed(2)} a €${newPaidAmount.toFixed(2)}. Insoluto: €${debtIncrease.toFixed(2)}. Motivo: ${reason}`
+          );
+        } else if (newPaymentMode === 'pagato' && newPaidAmount > original.amount) {
+          const debtReduction = Math.min(athlete.debt || 0, difference);
+          set({
+            athletes: get().athletes.map((a) =>
+              a.id === athleteId ? { ...a, debt: Math.max(0, Math.round(((a.debt || 0) - debtReduction) * 100) / 100) } : a
+            ),
+            closedTableDetails: updatedEntries,
+          });
+          get().logAudit(
+            'Rettifica: aumento importo',
+            `${athlete.name}: da €${original.amount.toFixed(2)} a €${newPaidAmount.toFixed(2)}. Ridotto debito: €${debtReduction.toFixed(2)}. Motivo: ${reason}`
+          );
+        } else if (newPaymentMode === 'sospeso') {
+          set({ closedTableDetails: updatedEntries });
+          get().logAudit(
+            'Rettifica: messo in sospeso',
+            `${athlete.name}: €${newPaidAmount.toFixed(2)}. Motivo: ${reason}`
+          );
+        } else {
+          set({ closedTableDetails: updatedEntries });
+          get().logAudit(
+            'Rettifica pagamento',
+            `${athlete.name}: €${newPaidAmount.toFixed(2)} (${newPaymentMode}). Motivo: ${reason}`
+          );
+        }
+        
+        if (difference !== 0) {
+          const revenueLine: RevenueLine = {
+            id: uid(),
+            source: 'tavolo',
+            description: `RETTIFICA ${entry.tableName} - ${athlete.name}: ${difference > 0 ? '+' : ''}${fmtEuro(difference)}`,
+            amount: Math.abs(difference),
+            at: Date.now(),
+            voided: difference < 0,
+            operator: get().currentOperator || 'Admin',
+          };
+          set({ revenueLines: [...get().revenueLines, revenueLine] });
+        }
+      },
+
+      batchRectifyPlayers: (entryId, athleteIds, newPaymentMode, reason) => {
+        const entries = get().closedTableDetails;
+        const entryIndex = entries.findIndex((e) => e.id === entryId);
+        if (entryIndex === -1) return;
+        const entry = entries[entryIndex];
+        const idSet = new Set(athleteIds);
+        
+        const updatedPlayers = entry.players.map((p) => {
+          if (!idSet.has(p.athleteId)) return p;
+          if (newPaymentMode === 'insoluto') {
+            return { ...p, amount: 0, paymentMode: 'insoluto' };
+          }
+          return { ...p, paymentMode: newPaymentMode };
+        });
+        
+        const newTotal = Math.round(updatedPlayers.reduce((sum, p) => sum + p.amount, 0) * 100) / 100;
+        
+        const updatedEntries = [...entries];
+        updatedEntries[entryIndex] = {
+          ...entry,
+          players: updatedPlayers,
+          total: newTotal,
+        };
+        
+        if (newPaymentMode === 'insoluto') {
+          const affectedPlayers = entry.players.filter((p) => idSet.has(p.athleteId));
+          let athletesUpdate = [...get().athletes];
+          affectedPlayers.forEach((p) => {
+            if (p.amount > 0) {
+              const idx = athletesUpdate.findIndex((a) => a.id === p.athleteId);
+              if (idx !== -1) {
+                athletesUpdate[idx] = { 
+                  ...athletesUpdate[idx], 
+                  debt: Math.round(((athletesUpdate[idx].debt || 0) + p.amount) * 100) / 100 
+                };
+              }
+            }
+          });
+          set({ athletes: athletesUpdate, closedTableDetails: updatedEntries });
+        } else {
+          set({ closedTableDetails: updatedEntries });
+        }
+        
+        const names = entry.players.filter((p) => idSet.has(p.athleteId)).map((p) => p.name).join(', ');
         get().logAudit(
-          'Rettifica pagamento tavolo chiuso',
-          `${athlete.name}: da €${original.amount.toFixed(2)} a €${newPaidAmount.toFixed(2)}. Insoluto: €${difference.toFixed(2)}. Motivo: ${reason}`
+          `Rettifica batch: ${newPaymentMode}`,
+          `${names}. Motivo: ${reason}`
         );
       },
     }),
