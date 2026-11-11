@@ -147,11 +147,37 @@ const getPlayerHours = (player: { joinTime?: number }, table: Table, now: number
   return Math.max(0, (elapsedMs - pauseAfterJoin) / 3600000);
 };
 
-const calcPlayerNolo = (player: { isSubscribed: boolean; joinTime?: number }, table: Table, now: number, baseRate: number, tableMax: number) => {
+// FIX: controlla dinamicamente se un atleta ha un abbonamento attivo
+const hasActiveSubscription = (athleteId: string, subscriptions: Subscription[], now: number): boolean => {
+  if (!athleteId || !subscriptions) return false;
+  const today = new Date(now);
+  return subscriptions.some(sub => 
+    sub.athleteId === athleteId && 
+    sub.status === 'pagato' &&
+    new Date(sub.startDate) <= today &&
+    new Date(sub.endDate) >= today
+  );
+};
+
+const calcPlayerNolo = (player: { isSubscribed: boolean; joinTime?: number; athleteId?: string }, table: Table, now: number, baseRate: number, tableMax: number, subscriptions: Subscription[]) => {
+  // Se il flag isSubscribed è già true, nolo = 0
   if (player.isSubscribed) return 0;
+  
+  // FIX: controllo dinamico abbonamenti attivi
+  if (player.athleteId && hasActiveSubscription(player.athleteId, subscriptions, now)) {
+    return 0;
+  }
+  
   const hours = getPlayerHours(player, table, now);
   const n = table.players.length;
-  const subscribedCount = table.players.filter(p => p.isSubscribed).length;
+  
+  // Conta i subscribed (statici + dinamici)
+  const subscribedCount = table.players.filter(p => {
+    if (p.isSubscribed) return true;
+    if (p.athleteId && hasActiveSubscription(p.athleteId, subscriptions, now)) return true;
+    return false;
+  }).length;
+  
   const noloPaying = n - subscribedCount;
   
   if (n <= 2) {
@@ -181,6 +207,13 @@ const recordTableClose = (
     })),
     total: perPlayer.reduce((s, a) => s + a, 0),
   };
+};
+
+const getClosedTableDetails = (state: StoreState): ClosedTableEntry[] => {
+  const ctd = state.closedTableDetails;
+  if (Array.isArray(ctd)) return ctd;
+  if (ctd && typeof ctd === 'object') return Object.values(ctd as any);
+  return [];
 };
 
 export const useStore = create<StoreState>()(
@@ -288,6 +321,7 @@ export const useStore = create<StoreState>()(
       openTable: (id, players) => {
         const now = Date.now();
         const athleteIds = new Set(players.map((p) => p.athleteId));
+        const subscriptions = get().subscriptions;
 
         const pendingFor = (athleteId: string) =>
           get().suspendedOrders
@@ -302,13 +336,17 @@ export const useStore = create<StoreState>()(
           (o) => !barOrdersToMigrate.includes(o)
         );
 
+        // FIX: calcola isSubscribed dinamicamente dagli abbonamenti attivi
         const playersWithMigratedItems = players.map((p) => {
           const playerBarItems = barOrdersToMigrate
             .filter((o) => o.athleteId === p.athleteId)
             .flatMap((o) => o.items || []);
 
+          const isSub = p.isSubscribed || hasActiveSubscription(p.athleteId, subscriptions, now);
+
           return {
             ...p,
+            isSubscribed: isSub,
             items: [...(p.items || []), ...playerBarItems],
             pendingTableDebt: pendingFor(p.athleteId),
             joinTime: now,
@@ -344,13 +382,17 @@ export const useStore = create<StoreState>()(
 
       addPlayerToTable: (tableId, p) => {
         const now = Date.now();
+        const subscriptions = get().subscriptions;
         const pendingTableDebt = get().suspendedOrders
           .filter((o) => o.athleteId === p.athleteId && o.source === 'tavolo' && o.status === 'sospeso')
           .reduce((s, o) => s + o.total, 0);
+        
+        const isSub = p.isSubscribed || hasActiveSubscription(p.athleteId, subscriptions, now);
+        
         set({
           tables: get().tables.map((t) =>
             t.id === tableId
-              ? { ...t, players: [...t.players, { ...p, items: [], pendingTableDebt, joinTime: now }] }
+              ? { ...t, players: [...t.players, { ...p, isSubscribed: isSub, items: [], pendingTableDebt, joinTime: now }] }
               : t
           ),
         });
@@ -421,11 +463,12 @@ export const useStore = create<StoreState>()(
         if (!t || t.status !== 'occupato') return null;
         const now = Date.now();
         const { baseRate, tableMax } = get().settings;
+        const subscriptions = get().subscriptions;
 
         const playerNoloMap = new Map<string, number>();
         let noloTheoreticalTotal = 0;
         t.players.forEach((p) => {
-          const nolo = calcPlayerNolo(p, t, now, baseRate, tableMax);
+          const nolo = calcPlayerNolo(p, t, now, baseRate, tableMax, subscriptions);
           playerNoloMap.set(p.athleteId, Math.round(nolo * 10) / 10);
           noloTheoreticalTotal += nolo;
         });
@@ -503,9 +546,10 @@ export const useStore = create<StoreState>()(
         };
 
         const entry = recordTableClose(t, checkouts, perPlayer, now);
+        const currentDetails = getClosedTableDetails(get());
 
         set({
-          closedTableDetails: [...get().closedTableDetails, entry],
+          closedTableDetails: [...currentDetails, entry],
           revenueLines: [...get().revenueLines, revenueLine],
           suspendedOrders: [
             ...get().suspendedOrders.filter(
@@ -563,6 +607,7 @@ export const useStore = create<StoreState>()(
         if (!t || t.status !== 'occupato') return null;
         const now = Date.now();
         const { baseRate, tableMax } = get().settings;
+        const subscriptions = get().subscriptions;
 
         const exitingIds = new Set(checkouts.map((c) => c.athleteId));
         const exitingPlayers = t.players.filter((p) => exitingIds.has(p.athleteId));
@@ -571,7 +616,7 @@ export const useStore = create<StoreState>()(
         const playerNoloMap = new Map<string, number>();
         let exitingNoloTheoretical = 0;
         exitingPlayers.forEach((p) => {
-          const nolo = calcPlayerNolo(p, t, now, baseRate, tableMax);
+          const nolo = calcPlayerNolo(p, t, now, baseRate, tableMax, subscriptions);
           playerNoloMap.set(p.athleteId, Math.round(nolo * 10) / 10);
           exitingNoloTheoretical += nolo;
         });
@@ -630,9 +675,10 @@ export const useStore = create<StoreState>()(
         const totalRounding = totalNoloRounding + totalBarRounding;
 
         const entry = recordTableClose(t, checkouts, perPlayer, now);
+        const currentDetails = getClosedTableDetails(get());
 
         set({
-          closedTableDetails: [...get().closedTableDetails, entry],
+          closedTableDetails: [...currentDetails, entry],
           suspendedOrders: [
             ...get().suspendedOrders.filter(
               (o) => !(o.source === 'tavolo' && o.status === 'sospeso' && exitingIds.has(o.athleteId))
@@ -679,7 +725,7 @@ export const useStore = create<StoreState>()(
         
         let cost = 0;
         t.players.forEach((p) => {
-          cost += calcPlayerNolo(p, t, now, baseRate, tableMax);
+          cost += calcPlayerNolo(p, t, now, baseRate, tableMax, get().subscriptions);
         });
         cost = Math.round(cost * 10) / 10;
 
@@ -950,7 +996,7 @@ export const useStore = create<StoreState>()(
       },
 
       rectifyClosedTablePayment: (entryId, athleteId, newPaidAmount, newPaymentMode, reason) => {
-        const entries = get().closedTableDetails;
+        const entries = getClosedTableDetails(get());
         const entryIndex = entries.findIndex((e) => e.id === entryId);
         if (entryIndex === -1) return;
         const entry = entries[entryIndex];
@@ -1026,7 +1072,7 @@ export const useStore = create<StoreState>()(
       },
 
       batchRectifyPlayers: (entryId, athleteIds, newPaymentMode, reason) => {
-        const entries = get().closedTableDetails;
+        const entries = getClosedTableDetails(get());
         const entryIndex = entries.findIndex((e) => e.id === entryId);
         if (entryIndex === -1) return;
         const entry = entries[entryIndex];

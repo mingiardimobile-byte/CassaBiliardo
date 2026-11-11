@@ -7,6 +7,17 @@ type PaymentMode = 'pagato' | 'sospeso' | 'insoluto';
 
 export default function Rettifiche() {
   const { closedTableDetails, athletes, rectifyClosedTablePayment, batchRectifyPlayers } = useStore();
+  // Migrazione automatica: se closedTableDetails è un oggetto (vecchio formato), convertilo in array
+  const normalizedClosedTableDetails = useMemo(() => {
+    if (Array.isArray(closedTableDetails)) {
+      return closedTableDetails;
+    }
+    if (closedTableDetails && typeof closedTableDetails === 'object') {
+      // Vecchio formato: converti in array
+      return Object.values(closedTableDetails);
+    }
+    return [];
+  }, [closedTableDetails]);
   const [editingEntryId, setEditingEntryId] = useState<string | null>(null);
   const [editingAthleteId, setEditingAthleteId] = useState<string | null>(null);
   const [newAmount, setNewAmount] = useState('');
@@ -14,13 +25,17 @@ export default function Rettifiche() {
   const [reason, setReason] = useState('');
   const [selectedPlayers, setSelectedPlayers] = useState<Set<string>>(new Set());
 
+  // FIX: controllo di sicurezza per closedTableDetails
+    const safeClosedTableDetails = normalizedClosedTableDetails;
+
   const todayEntries = useMemo(() => {
     const startOfDay = new Date();
     startOfDay.setHours(0, 0, 0, 0);
-    return closedTableDetails
+    
+    return safeClosedTableDetails
       .filter((e) => e.closeTime >= startOfDay.getTime())
       .sort((a, b) => b.closeTime - a.closeTime);
-  }, [closedTableDetails]);
+  }, [safeClosedTableDetails]);
 
   const groupedByTable = useMemo(() => {
     const groups: Record<number, typeof todayEntries> = {};
