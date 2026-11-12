@@ -108,7 +108,7 @@ export type Expense = {
 
 export type RevenueLine = {
   id: string;
-  source: 'tavolo' | 'sospeso' | 'abbonamento' | 'bar';
+  source: 'tavolo' | 'sospeso' | 'abbonamento' | 'bar' | 'insoluto_saldato';
   description: string;
   amount: number;
   at: number;
@@ -201,4 +201,19 @@ export type ClosedTableEntry = {
     paymentMode: 'pagato' | 'sospeso' | 'insoluto';
   }[];
   total: number;
+};
+
+// NUOVO TIPO: Debiti pendenti (sospesi e insoluti)
+export type PendingDebt = {
+  id: string;
+  athleteId: string;
+  athleteName: string;
+  amount: number;
+  type: 'sospeso' | 'insoluto';
+  source: 'tavolo' | 'rettifica';
+  tableId?: number;
+  tableName?: string;
+  createdAt: number;
+  reason?: string;
+  paidAt?: number | null;
 };

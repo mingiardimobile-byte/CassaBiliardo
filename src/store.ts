@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type {
   Table, Product, Athlete, SuspendedOrder, Subscription,
-  Reconciliation, Settings, AuditEntry, RevenueLine, BarItem, Expense, PlayerCheckout, ClosedTableEntry,
+  Reconciliation, Settings, AuditEntry, RevenueLine, BarItem, Expense, PlayerCheckout, ClosedTableEntry, PendingDebt,
 } from '@/types';
 import { fmtEuro } from '@/lib/utils';
 
@@ -24,6 +24,7 @@ type StoreState = {
   isOwnerUnlocked: boolean;
   lastActivity: number;
   closedTableDetails: ClosedTableEntry[];
+  pendingDebts: PendingDebt[];
 
   setOperator: (name: string) => void;
   unlockAdmin: (password: string) => boolean;
@@ -91,6 +92,13 @@ type StoreState = {
   rectifyClosedTablePayment: (entryId: string, athleteId: string, newPaidAmount: number, newPaymentMode: 'pagato' | 'sospeso' | 'insoluto', reason: string) => void;
   batchRectifyPlayers: (entryId: string, athleteIds: string[], newPaymentMode: 'pagato' | 'sospeso' | 'insoluto', reason: string) => void;
   logAudit: (action: string, value: string) => void;
+
+  addPendingDebt: (debt: Omit<PendingDebt, 'id' | 'createdAt'>) => void;
+  assignDebtToTable: (debtId: string, tableId: number) => void;
+  assignDebtToAthlete: (debtId: string) => void;
+  markDebtAsPaid: (debtId: string) => void;
+  deletePendingDebt: (debtId: string) => void;
+  convertSuspendedToInsoluto: () => void;
 };
 
 const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
@@ -147,7 +155,6 @@ const getPlayerHours = (player: { joinTime?: number }, table: Table, now: number
   return Math.max(0, (elapsedMs - pauseAfterJoin) / 3600000);
 };
 
-// FIX: controlla dinamicamente se un atleta ha un abbonamento attivo
 const hasActiveSubscription = (athleteId: string, subscriptions: Subscription[], now: number): boolean => {
   if (!athleteId || !subscriptions) return false;
   const today = new Date(now);
@@ -160,26 +167,18 @@ const hasActiveSubscription = (athleteId: string, subscriptions: Subscription[],
 };
 
 const calcPlayerNolo = (player: { isSubscribed: boolean; joinTime?: number; athleteId?: string }, table: Table, now: number, baseRate: number, tableMax: number, subscriptions: Subscription[]) => {
-  // Se il flag isSubscribed è già true, nolo = 0
   if (player.isSubscribed) return 0;
-  
-  // FIX: controllo dinamico abbonamenti attivi
   if (player.athleteId && hasActiveSubscription(player.athleteId, subscriptions, now)) {
     return 0;
   }
-  
   const hours = getPlayerHours(player, table, now);
   const n = table.players.length;
-  
-  // Conta i subscribed (statici + dinamici)
   const subscribedCount = table.players.filter(p => {
     if (p.isSubscribed) return true;
     if (p.athleteId && hasActiveSubscription(p.athleteId, subscriptions, now)) return true;
     return false;
   }).length;
-  
   const noloPaying = n - subscribedCount;
-  
   if (n <= 2) {
     return baseRate * hours;
   } else {
@@ -236,6 +235,7 @@ export const useStore = create<StoreState>()(
       isOwnerUnlocked: false,
       lastActivity: Date.now(),
       closedTableDetails: [],
+      pendingDebts: [],
 
       setOperator: (name) => set({ currentOperator: name }),
 
@@ -336,7 +336,6 @@ export const useStore = create<StoreState>()(
           (o) => !barOrdersToMigrate.includes(o)
         );
 
-        // FIX: calcola isSubscribed dinamicamente dagli abbonamenti attivi
         const playersWithMigratedItems = players.map((p) => {
           const playerBarItems = barOrdersToMigrate
             .filter((o) => o.athleteId === p.athleteId)
@@ -344,11 +343,15 @@ export const useStore = create<StoreState>()(
 
           const isSub = p.isSubscribed || hasActiveSubscription(p.athleteId, subscriptions, now);
 
+          const pendingDebt = get().pendingDebts
+            .filter((d) => d.athleteId === p.athleteId && !d.paidAt)
+            .reduce((sum, d) => sum + d.amount, 0);
+
           return {
             ...p,
             isSubscribed: isSub,
             items: [...(p.items || []), ...playerBarItems],
-            pendingTableDebt: pendingFor(p.athleteId),
+            pendingTableDebt: pendingFor(p.athleteId) + pendingDebt,
             joinTime: now,
           };
         });
@@ -389,10 +392,14 @@ export const useStore = create<StoreState>()(
         
         const isSub = p.isSubscribed || hasActiveSubscription(p.athleteId, subscriptions, now);
         
+        const pendingDebt = get().pendingDebts
+          .filter((d) => d.athleteId === p.athleteId && !d.paidAt)
+          .reduce((sum, d) => sum + d.amount, 0);
+        
         set({
           tables: get().tables.map((t) =>
             t.id === tableId
-              ? { ...t, players: [...t.players, { ...p, isSubscribed: isSub, items: [], pendingTableDebt, joinTime: now }] }
+              ? { ...t, players: [...t.players, { ...p, isSubscribed: isSub, items: [], pendingTableDebt: pendingTableDebt + pendingDebt, joinTime: now }] }
               : t
           ),
         });
@@ -487,6 +494,7 @@ export const useStore = create<StoreState>()(
         const perPlayer: number[] = [];
         const foldedAthleteIds = new Set<string>();
         const foldedSuspensions: SuspendedOrder[] = [];
+        const newPendingDebts: PendingDebt[] = [];
 
         checkouts.forEach((c) => {
           const noloTheo = playerNoloMap.get(c.athleteId) ?? 0;
@@ -502,22 +510,31 @@ export const useStore = create<StoreState>()(
           foldedAthleteIds.add(c.athleteId);
 
           if (c.paymentMode === 'insoluto' && playerFinal > 0) {
-            set({
-              athletes: get().athletes.map((a) =>
-                a.id === c.athleteId ? { ...a, debt: a.debt + playerFinal } : a
-              ),
-            });
-            get().logAudit('Insoluto da chiusura tavolo', `${c.name} €${playerFinal.toFixed(2)}`);
-          } else if (c.paymentMode === 'sospeso' && playerFinal > 0) {
-            foldedSuspensions.push({
+            newPendingDebts.push({
               id: uid(),
               athleteId: c.athleteId,
               athleteName: c.name,
-              items: [],
-              total: playerFinal,
-              createdAt: now,
-              status: 'sospeso',
+              amount: playerFinal,
+              type: 'insoluto',
               source: 'tavolo',
+              tableId: t.id,
+              tableName: t.name,
+              createdAt: now,
+              reason: `Chiusura tavolo ${t.name} (${mode})`,
+            });
+            get().logAudit('Insoluto da chiusura tavolo', `${c.name} €${playerFinal.toFixed(2)}`);
+          } else if (c.paymentMode === 'sospeso' && playerFinal > 0) {
+            newPendingDebts.push({
+              id: uid(),
+              athleteId: c.athleteId,
+              athleteName: c.name,
+              amount: playerFinal,
+              type: 'sospeso',
+              source: 'tavolo',
+              tableId: t.id,
+              tableName: t.name,
+              createdAt: now,
+              reason: `Chiusura tavolo ${t.name} (${mode})`,
             });
             get().logAudit('Sospeso tavolo', `${c.name} €${playerFinal.toFixed(2)}`);
           } else {
@@ -550,6 +567,7 @@ export const useStore = create<StoreState>()(
 
         set({
           closedTableDetails: [...currentDetails, entry],
+          pendingDebts: [...get().pendingDebts, ...newPendingDebts],
           revenueLines: [...get().revenueLines, revenueLine],
           suspendedOrders: [
             ...get().suspendedOrders.filter(
@@ -630,6 +648,7 @@ export const useStore = create<StoreState>()(
         let totalBarDiscount = 0;
         let totalBarRounding = 0;
         let exitingBarTotal = 0;
+        const newPendingDebts: PendingDebt[] = [];
 
         checkouts.forEach((c) => {
           const noloTheo = playerNoloMap.get(c.athleteId) ?? 0;
@@ -649,22 +668,31 @@ export const useStore = create<StoreState>()(
           totalBarRounding += c.barRounding;
 
           if (c.paymentMode === 'insoluto' && playerFinal > 0) {
-            set({
-              athletes: get().athletes.map((a) =>
-                a.id === c.athleteId ? { ...a, debt: a.debt + playerFinal } : a
-              ),
-            });
-            get().logAudit('Insoluto da uscita parziale', `${c.name} €${playerFinal.toFixed(2)}`);
-          } else if (c.paymentMode === 'sospeso' && playerFinal > 0) {
-            rotatedSuspensions.push({
+            newPendingDebts.push({
               id: uid(),
               athleteId: c.athleteId,
               athleteName: c.name,
-              items: [],
-              total: playerFinal,
-              createdAt: now,
-              status: 'sospeso',
+              amount: playerFinal,
+              type: 'insoluto',
               source: 'tavolo',
+              tableId: t.id,
+              tableName: t.name,
+              createdAt: now,
+              reason: `Uscita parziale tavolo ${t.name}`,
+            });
+            get().logAudit('Insoluto da uscita parziale', `${c.name} €${playerFinal.toFixed(2)}`);
+          } else if (c.paymentMode === 'sospeso' && playerFinal > 0) {
+            newPendingDebts.push({
+              id: uid(),
+              athleteId: c.athleteId,
+              athleteName: c.name,
+              amount: playerFinal,
+              type: 'sospeso',
+              source: 'tavolo',
+              tableId: t.id,
+              tableName: t.name,
+              createdAt: now,
+              reason: `Uscita parziale tavolo ${t.name}`,
             });
             get().logAudit('Sospeso Nolo (rotazione)', `${c.name} €${playerFinal.toFixed(2)}`);
           }
@@ -679,6 +707,7 @@ export const useStore = create<StoreState>()(
 
         set({
           closedTableDetails: [...currentDetails, entry],
+          pendingDebts: [...get().pendingDebts, ...newPendingDebts],
           suspendedOrders: [
             ...get().suspendedOrders.filter(
               (o) => !(o.source === 'tavolo' && o.status === 'sospeso' && exitingIds.has(o.athleteId))
@@ -793,6 +822,19 @@ export const useStore = create<StoreState>()(
       markInsoluto: (id) => {
         const o = get().suspendedOrders.find((x) => x.id === id);
         if (!o) return;
+        
+        // Crea anche un pendingDebt per mostrarlo nella pagina Insoluti
+        const newPendingDebt: PendingDebt = {
+          id: uid(),
+          athleteId: o.athleteId,
+          athleteName: o.athleteName,
+          amount: o.total,
+          type: 'insoluto',
+          source: o.source || 'bar',
+          createdAt: Date.now(),
+          reason: `Ordine bar insoluto: ${o.items.map((i) => `${i.name} x${i.qty}`).join(', ')}`,
+        };
+        
         set({
           suspendedOrders: get().suspendedOrders.map((x) =>
             x.id === id ? { ...x, status: 'insoluto' } : x
@@ -800,6 +842,7 @@ export const useStore = create<StoreState>()(
           athletes: get().athletes.map((a) =>
             a.id === o.athleteId ? { ...a, debt: a.debt + o.total } : a
           ),
+          pendingDebts: [...get().pendingDebts, newPendingDebt],
         });
         get().logAudit('Insoluto registrato', `${o.athleteName} €${o.total.toFixed(2)}`);
       },
@@ -921,6 +964,12 @@ export const useStore = create<StoreState>()(
           logs: get().auditLog,
           closedAt: Date.now(),
         };
+
+        const now = Date.now();
+        const updatedDebts = get().pendingDebts.map((d) =>
+          d.type === 'sospeso' && !d.paidAt ? { ...d, type: 'insoluto' as const } : d
+        );
+
         set({
           reconciliations: [...get().reconciliations, rec],
           revenueLines: [],
@@ -928,6 +977,7 @@ export const useStore = create<StoreState>()(
           auditLog: [],
           fund: fund + revenue - expenses,
           closedTableDetails: [],
+          pendingDebts: updatedDebts,
         });
         get().logAudit('Chiusura cassa', dateStr);
         return rec;
@@ -954,6 +1004,7 @@ export const useStore = create<StoreState>()(
           fund: 0,
           cumulativeTotalizer: get().cumulativeTotalizer,
           closedTableDetails: [],
+          pendingDebts: [],
         }),
 
       importState: (s) => set({ ...s }),
@@ -1019,13 +1070,38 @@ export const useStore = create<StoreState>()(
           total: newTotal,
         };
         
+        let updatedDebts = [...get().pendingDebts];
+        
         if (newPaymentMode === 'insoluto' && newPaidAmount < original.amount) {
           const debtIncrease = Math.round((original.amount - newPaidAmount) * 100) / 100;
+          const existingDebtIndex = updatedDebts.findIndex(
+            (d) => d.athleteId === athleteId && d.type === 'insoluto' && !d.paidAt && d.tableId === entry.tableId
+          );
+          if (existingDebtIndex !== -1) {
+            updatedDebts[existingDebtIndex] = {
+              ...updatedDebts[existingDebtIndex],
+              amount: Math.round((updatedDebts[existingDebtIndex].amount + debtIncrease) * 100) / 100,
+            };
+          } else {
+            updatedDebts.push({
+              id: uid(),
+              athleteId: athleteId,
+              athleteName: athlete.name,
+              amount: debtIncrease,
+              type: 'insoluto',
+              source: 'rettifica',
+              tableId: entry.tableId,
+              tableName: entry.tableName,
+              createdAt: Date.now(),
+              reason: reason,
+            });
+          }
           set({
             athletes: get().athletes.map((a) =>
               a.id === athleteId ? { ...a, debt: Math.round(((a.debt || 0) + debtIncrease) * 100) / 100 } : a
             ),
             closedTableDetails: updatedEntries,
+            pendingDebts: updatedDebts,
           });
           get().logAudit(
             'Rettifica: riduzione importo',
@@ -1044,7 +1120,29 @@ export const useStore = create<StoreState>()(
             `${athlete.name}: da €${original.amount.toFixed(2)} a €${newPaidAmount.toFixed(2)}. Ridotto debito: €${debtReduction.toFixed(2)}. Motivo: ${reason}`
           );
         } else if (newPaymentMode === 'sospeso') {
-          set({ closedTableDetails: updatedEntries });
+          const existingDebtIndex = updatedDebts.findIndex(
+            (d) => d.athleteId === athleteId && d.type === 'sospeso' && !d.paidAt && d.tableId === entry.tableId
+          );
+          if (existingDebtIndex !== -1) {
+            updatedDebts[existingDebtIndex] = {
+              ...updatedDebts[existingDebtIndex],
+              amount: newPaidAmount,
+            };
+          } else {
+            updatedDebts.push({
+              id: uid(),
+              athleteId: athleteId,
+              athleteName: athlete.name,
+              amount: newPaidAmount,
+              type: 'sospeso',
+              source: 'rettifica',
+              tableId: entry.tableId,
+              tableName: entry.tableName,
+              createdAt: Date.now(),
+              reason: reason,
+            });
+          }
+          set({ closedTableDetails: updatedEntries, pendingDebts: updatedDebts });
           get().logAudit(
             'Rettifica: messo in sospeso',
             `${athlete.name}: €${newPaidAmount.toFixed(2)}. Motivo: ${reason}`
@@ -1095,6 +1193,8 @@ export const useStore = create<StoreState>()(
           total: newTotal,
         };
         
+        let updatedDebts = [...get().pendingDebts];
+        
         if (newPaymentMode === 'insoluto') {
           const affectedPlayers = entry.players.filter((p) => idSet.has(p.athleteId));
           let athletesUpdate = [...get().athletes];
@@ -1107,9 +1207,40 @@ export const useStore = create<StoreState>()(
                   debt: Math.round(((athletesUpdate[idx].debt || 0) + p.amount) * 100) / 100 
                 };
               }
+              updatedDebts.push({
+                id: uid(),
+                athleteId: p.athleteId,
+                athleteName: p.name,
+                amount: p.amount,
+                type: 'insoluto',
+                source: 'rettifica',
+                tableId: entry.tableId,
+                tableName: entry.tableName,
+                createdAt: Date.now(),
+                reason: `Rettifica batch: ${reason}`,
+              });
             }
           });
-          set({ athletes: athletesUpdate, closedTableDetails: updatedEntries });
+          set({ athletes: athletesUpdate, closedTableDetails: updatedEntries, pendingDebts: updatedDebts });
+        } else if (newPaymentMode === 'sospeso') {
+          const affectedPlayers = entry.players.filter((p) => idSet.has(p.athleteId));
+          affectedPlayers.forEach((p) => {
+            if (p.amount > 0) {
+              updatedDebts.push({
+                id: uid(),
+                athleteId: p.athleteId,
+                athleteName: p.name,
+                amount: p.amount,
+                type: 'sospeso',
+                source: 'rettifica',
+                tableId: entry.tableId,
+                tableName: entry.tableName,
+                createdAt: Date.now(),
+                reason: `Rettifica batch: ${reason}`,
+              });
+            }
+          });
+          set({ closedTableDetails: updatedEntries, pendingDebts: updatedDebts });
         } else {
           set({ closedTableDetails: updatedEntries });
         }
@@ -1119,6 +1250,110 @@ export const useStore = create<StoreState>()(
           `Rettifica batch: ${newPaymentMode}`,
           `${names}. Motivo: ${reason}`
         );
+      },
+
+      addPendingDebt: (debt) => {
+        const newDebt: PendingDebt = {
+          ...debt,
+          id: uid(),
+          createdAt: Date.now(),
+        };
+        set({ pendingDebts: [...get().pendingDebts, newDebt] });
+        get().logAudit('Debito aggiunto', `${debt.athleteName} €${debt.amount.toFixed(2)} (${debt.type})`);
+      },
+
+      assignDebtToTable: (debtId, tableId) => {
+        const debt = get().pendingDebts.find((d) => d.id === debtId);
+        if (!debt || debt.paidAt) return;
+        
+        const table = get().tables.find((t) => t.id === tableId && t.status === 'occupato');
+        if (!table) {
+          alert('Tavolo non trovato o non occupato');
+          return;
+        }
+        
+        const playerIndex = table.players.findIndex((p) => p.athleteId === debt.athleteId);
+        if (playerIndex === -1) {
+          alert('Il socio non è presente in questo tavolo');
+          return;
+        }
+        
+        const updatedTables = get().tables.map((t) => {
+          if (t.id !== tableId) return t;
+          const updatedPlayers = [...t.players];
+          updatedPlayers[playerIndex] = {
+            ...updatedPlayers[playerIndex],
+            pendingTableDebt: (updatedPlayers[playerIndex].pendingTableDebt || 0) + debt.amount,
+          };
+          return { ...t, players: updatedPlayers };
+        });
+        
+        const updatedDebts = get().pendingDebts.map((d) =>
+          d.id === debtId ? { ...d, paidAt: Date.now() } : d
+        );
+        
+        set({ tables: updatedTables, pendingDebts: updatedDebts });
+        get().logAudit('Debito assegnato a tavolo', `${debt.athleteName} €${debt.amount.toFixed(2)} → Tavolo ${tableId}`);
+      },
+
+      assignDebtToAthlete: (debtId) => {
+        const debt = get().pendingDebts.find((d) => d.id === debtId);
+        if (!debt || debt.paidAt) return;
+        
+        const updatedAthletes = get().athletes.map((a) =>
+          a.id === debt.athleteId ? { ...a, debt: Math.round((a.debt + debt.amount) * 100) / 100 } : a
+        );
+        
+        const updatedDebts = get().pendingDebts.map((d) =>
+          d.id === debtId ? { ...d, paidAt: Date.now() } : d
+        );
+        
+        set({ athletes: updatedAthletes, pendingDebts: updatedDebts });
+        get().logAudit('Debito assegnato a socio', `${debt.athleteName} €${debt.amount.toFixed(2)} → Debito personale`);
+      },
+
+      markDebtAsPaid: (debtId) => {
+        const debt = get().pendingDebts.find((d) => d.id === debtId);
+        if (!debt || debt.paidAt) return;
+        
+        const revenueLine: RevenueLine = {
+          id: uid(),
+          source: debt.type === 'sospeso' ? 'sospeso' : 'insoluto_saldato',
+          description: `${debt.type === 'sospeso' ? 'Sospeso' : 'Insoluto'} saldato - ${debt.athleteName}${debt.tableName ? ` (${debt.tableName})` : ''}`,
+          amount: debt.amount,
+          at: Date.now(),
+          operator: get().currentOperator || 'Operatore',
+        };
+        
+        const updatedDebts = get().pendingDebts.map((d) =>
+          d.id === debtId ? { ...d, paidAt: Date.now() } : d
+        );
+        
+        set({
+          revenueLines: [...get().revenueLines, revenueLine],
+          pendingDebts: updatedDebts,
+        });
+        get().logAudit('Debito saldato', `${debt.athleteName} €${debt.amount.toFixed(2)} (${debt.type})`);
+      },
+
+      deletePendingDebt: (debtId) => {
+        const debt = get().pendingDebts.find((d) => d.id === debtId);
+        if (!debt) return;
+        if (debt.type === 'insoluto') {
+          alert('Non è possibile eliminare un insoluto. Può essere solo saldato.');
+          return;
+        }
+        set({ pendingDebts: get().pendingDebts.filter((d) => d.id !== debtId) });
+        get().logAudit('Debito sospeso eliminato', `${debt.athleteName} €${debt.amount.toFixed(2)}`);
+      },
+
+      convertSuspendedToInsoluto: () => {
+        const now = Date.now();
+        const updatedDebts = get().pendingDebts.map((d) =>
+          d.type === 'sospeso' && !d.paidAt ? { ...d, type: 'insoluto' as const } : d
+        );
+        set({ pendingDebts: updatedDebts });
+        get().logAudit('Sospesi convertiti in insoluti', `${updatedDebts.filter((d) => d.type === 'insoluto').length} debiti`);
       },
     }),
     { name: 'cassa-biliardo' }
